@@ -550,21 +550,21 @@ def get_param_grids(tabular: bool = False, boolean: bool = False) -> Dict[str, D
 
 def get_base_models(seed: int, include_ga: bool = False, include_tabpfn: bool = False) -> Dict[str, Any]:
     models = {
-        # "svm": SVC(random_state=seed),
-        # "random_forest": RandomForestClassifier(random_state=seed),
-        # "decision_tree": DecisionTreeClassifier(random_state=seed),
-        # "xgboost": XGBClassifier(
-        #     booster='gbtree', 
-        #     random_state=seed, 
-        #     objective='binary:logistic', 
-        #     verbosity=0,
-        #     tree_method='hist',
-        #     device='cpu'
-        # ),
+        "svm": SVC(random_state=seed),
+        "random_forest": RandomForestClassifier(random_state=seed),
+        "decision_tree": DecisionTreeClassifier(random_state=seed),
+        "xgboost": XGBClassifier(
+           booster='gbtree', 
+           random_state=seed, 
+           objective='binary:logistic', 
+           verbosity=0,
+           tree_method='hist',
+           device='cpu'
+        ),
     }
     
-    # if include_ga:
-    #     models["genetic_algorithm"] = GeneticAlgorithmClassifier(random_state=seed)
+    if include_ga:
+        models["genetic_algorithm"] = GeneticAlgorithmClassifier(random_state=seed)
     
     if include_tabpfn:
         models["tabpfn"] = TabPFNClassifier()
