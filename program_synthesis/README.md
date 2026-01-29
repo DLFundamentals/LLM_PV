@@ -1,4 +1,4 @@
-# LLM-ERM (OpenAI Responses API)
+# LLM-PV (OpenAI Responses API)
 
 **Goal:** Prompt a reasoning-capable model to output **executable Python** that implements a hidden mapping. We compile & evaluate the returned function, track validation/test accuracy, and **early-stop** when validation hits **1.0**. Datasets are **deterministic and persisted** per task.
 
@@ -14,7 +14,7 @@
 
 ## Setup
 ```bash
-conda activate llm_erm
+conda activate llm_pv
 # Assuming requirements are installed
 export OPENAI_API_KEY=sk-...   # required
 ```
