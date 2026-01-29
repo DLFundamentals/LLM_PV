@@ -155,31 +155,6 @@ def gcd_range(v: torch.Tensor, device: str) -> torch.Tensor:
             results.append(0)
     return torch.tensor(results, device=device, dtype=torch.long)
 
-def collatz_steps_parity(v: torch.Tensor, device: str) -> torch.Tensor:
-    """Returns 1 if the number of Collatz steps to reach 1 is odd, 0 if even.
-    Collatz sequence: if n is even, n -> n/2; if n is odd, n -> 3n+1.
-    Count steps until n == 1, return steps % 2."""
-    results = []
-    for row in v:
-        n = int("".join(map(str, row.tolist())))
-        if n <= 0:
-            results.append(0)
-            continue
-        
-        steps = 0
-        current = n
-        max_steps = 10000  # Safety limit
-        while current != 1 and steps < max_steps:
-            if current % 2 == 0:
-                current = current // 2
-            else:
-                current = 3 * current + 1
-            steps += 1
-        
-        results.append(steps % 2)
-    
-    return torch.tensor(results, device=device, dtype=torch.long)
-
 _poly_cache = {}
 
 def _generate_monomials(n: int, k: int, d: int, T: int, seed: int) -> Tuple[Tuple[Tuple[int, ...], ...], Tuple[int, ...]]:
@@ -302,88 +277,6 @@ def graph_has_cycle(v: torch.Tensor, device: str) -> torch.Tensor:
     
     return torch.tensor(results, device=device, dtype=torch.long)
 
-def graph_triangle_rich(v: torch.Tensor, device: str) -> torch.Tensor:
-    """Checks if the graph has many triangles (>= threshold).
-    A triangle is a 3-clique: 3 vertices all connected to each other.
-    Threshold is dynamic: max(2, num_edges // 3).
-    Input format: u12v23 style (6 chars per edge: 'u' + 2-digit src + 'v' + 2-digit dst).
-    Accepts both character format (for data generation) and numeric token format (for LLM training).
-    Numeric tokens: 'u'=10, 'v'=11, digits 0-9=themselves.
-    Returns 1 if triangle_count >= threshold, 0 otherwise."""
-    import re
-    results = []
-    
-    for row in v:
-        tokens = row.int().tolist()
-        
-        # Decode based on format
-        decoded = []
-        for t in tokens:
-            if t == 10:  # Numeric token for 'u'
-                decoded.append('u')
-            elif t == 11:  # Numeric token for 'v'
-                decoded.append('v')
-            elif t == 117:  # ASCII 'u'
-                decoded.append('u')
-            elif t == 118:  # ASCII 'v'
-                decoded.append('v')
-            elif 0 <= t <= 9:  # Direct digit
-                decoded.append(str(t))
-            elif 48 <= t <= 57:  # ASCII digit '0'-'9'
-                decoded.append(chr(t))
-        raw = ''.join(decoded)
-        
-        # Build edge set for O(1) lookup
-        edge_set = set()
-        vertices = set()
-        
-        # Parse u12v23 format
-        edge_pattern = re.compile(r'u(\d{2})v(\d{2})')
-        for match in edge_pattern.finditer(raw):
-            v1, v2 = int(match.group(1)), int(match.group(2))
-            if v1 == 0 and v2 == 0:
-                continue
-            edge_set.add((min(v1, v2), max(v1, v2)))
-            vertices.add(v1)
-            vertices.add(v2)
-        
-        if len(vertices) < 3:
-            results.append(0)
-            continue
-        
-        # Dynamic threshold based on edge count
-        num_edges = len(edge_set)
-        threshold = max(2, num_edges // 3)
-        
-        # Count triangles: for each triple of vertices, check if all 3 edges exist
-        triangle_count = 0
-        vertex_list = sorted(vertices)
-        n = len(vertex_list)
-        
-        for i in range(n - 2):
-            vi = vertex_list[i]
-            for j in range(i + 1, n - 1):
-                vj = vertex_list[j]
-                # Early exit: check if edge (i,j) exists
-                if (min(vi, vj), max(vi, vj)) not in edge_set:
-                    continue
-                for k in range(j + 1, n):
-                    vk = vertex_list[k]
-                    # Check if edges (i,k) and (j,k) exist
-                    if ((min(vi, vk), max(vi, vk)) in edge_set and
-                        (min(vj, vk), max(vj, vk)) in edge_set):
-                        triangle_count += 1
-                        if triangle_count >= threshold:
-                            break
-                if triangle_count >= threshold:
-                    break
-            if triangle_count >= threshold:
-                break
-        
-        results.append(1 if triangle_count >= threshold else 0)
-    
-    return torch.tensor(results, device=device, dtype=torch.long)
-
 def tabular_dummy(v: torch.Tensor, device: str) -> torch.Tensor:
     """Dummy function for tabular datasets (labels come from data generators)."""
     return torch.zeros(v.size(0), dtype=torch.long, device=device)
@@ -405,10 +298,8 @@ TARGET_FUNCTIONS: Dict[str, Callable[[torch.Tensor, str], torch.Tensor]] = {
     'prime_minus_5': prime_minus_5,
     'prime_plus_47': prime_plus_47,
     'gcd_range': gcd_range,
-    'collatz_steps_parity': collatz_steps_parity,
     'poly_f2_deg3': poly_f2_deg3,
     'graph_has_cycle': graph_has_cycle,
-    'graph_triangle_rich': graph_triangle_rich,
     'adult_income': tabular_dummy,
     'mushroom': tabular_dummy,
     'cdc_diabetes': tabular_dummy,
@@ -433,9 +324,7 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_k": "prime_decimal_tf_check",
     "fn_l": "sha256_parity",
     "fn_v": "prime_plus_47",
-    # "fn_t": "collatz_steps_parity",
     "fn_aa": "graph_has_cycle",
-    "fn_ab": "graph_triangle_rich",
     # Tabular datasets
     "fn_m": "adult_income",
     "fn_n": "mushroom",
