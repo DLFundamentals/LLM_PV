@@ -1,7 +1,7 @@
 # environment.yml
 # This file is for Conda. It sets up the core environment.
 
-name: llm_erm
+name: llm_pv
 channels:
   - pytorch        # Highest priority for PyTorch packages
   - nvidia         # For CUDA components
