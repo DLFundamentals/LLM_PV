@@ -1,7 +1,5 @@
 # LLM-ERM: 
 
-[GitHub Page](https://github.com/DLFundamentals/LLM_ERM) • [Project Page]() • [Paper Page](https://arxiv.org/abs/2510.14331)
-
 Our work addresses the following question : 
 > Can we design learning algorithms that combine the sample efficiency of finite-class program search with the computational efficiency of modern optimization methods?
 
@@ -62,19 +60,3 @@ python finetuning/main.py --results-path ./results_new/0/0 --model qwen1.7B --ta
 > - [`program_synthesis/README.md`](program_synthesis/README.md)  
 > - [`in_context_learning/README.md`](in_context_learning/README.md)  
 > - [`finetuning/README.md`](finetuning/README.md)
-
-## Citation
-
-If you find our work useful in your research or applications, please cite us using the following BibTeX:
-
-```bash
-@misc{singhal2025llmermsampleefficientprogramlearning,
-      title={LLM-ERM: Sample-Efficient Program Learning via LLM-Guided Search}, 
-      author={Shivam Singhal and Eran Malach and Tomaso Poggio and Tomer Galanti},
-      year={2025},
-      eprint={2510.14331},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2510.14331}, 
-}
-```
