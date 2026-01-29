@@ -17,7 +17,7 @@ Train (or finetune) LMs to **classify sequences** (binary/decimal) using the *sa
 
 ## Setup
 ```bash
-conda activate llm_erm
+conda activate llm_pv
 # Assuming requirements are installed
 ```
 
