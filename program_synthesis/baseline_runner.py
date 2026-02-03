@@ -295,7 +295,7 @@ class Config:
     functions: List[str] = field(default_factory=lambda: [
         "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
         "fn_g", "fn_h", "fn_i", "fn_j", "fn_k", "fn_l", "fn_v", "fn_t",
-        "fn_m", "fn_n", "fn_o", "fn_p", "fn_q", "fn_r",
+        "fn_m", "fn_n", "fn_o", "fn_p", "fn_q", "fn_aa",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
     train_size: int = int(os.getenv("TRAIN_SIZE", "100"))

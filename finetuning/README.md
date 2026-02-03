@@ -86,7 +86,7 @@ grid:
   - `fn_p` (htru2): `8`
   - `fn_q` (chess): `35`
 
-- **`fn_r` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
+- **`fn_aa` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
 
 ---
 

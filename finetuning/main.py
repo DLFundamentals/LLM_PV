@@ -198,9 +198,9 @@ def load_data(args, logger):
             sequence_length = required_lengths[0]
         else:
             logger.info(f"Using provided sequence_length {sequence_length} for {args.target_func}")
-    elif args.target_func == "fn_r":
+    elif args.target_func == "fn_aa":
         if sequence_length % 4 != 0:
-            raise ValueError(f"fn_r (graph_has_cycle) requires sequence_length to be a multiple of 4, got {sequence_length}")
+            raise ValueError(f"fn_aa (graph_has_cycle) requires sequence_length to be a multiple of 4, got {sequence_length}")
     
     dataset = CodeDataset(
         python_code=python_code, sequence_length=sequence_length,

@@ -329,7 +329,7 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_p": "htru2",
     "fn_q": "chess",
     # Graph problems
-    "fn_r": "graph_has_cycle",
+    "fn_aa": "graph_has_cycle",
 }
 
 EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {

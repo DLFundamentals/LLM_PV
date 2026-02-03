@@ -1261,7 +1261,7 @@ class GraphCycleDataGenerator(BaseDataGenerator):
 
 
 class CycleDetectionDataGenerator(BaseDataGenerator):
-    """fn_r: Cycle Density task - does cycle count exceed threshold?
+    """fn_aa: Cycle Density task - does cycle count exceed threshold?
     
     Both classes have IDENTICAL: node count V, edge count E.
     Cycle count = E - V + C (cyclomatic complexity, where C = connected components).
