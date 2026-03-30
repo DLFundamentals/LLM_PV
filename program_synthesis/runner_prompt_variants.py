@@ -128,46 +128,38 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
 
 
 DEFAULT_PROMPT_VARIANTS: List[Dict[str, str]] = [
-    # {
-    #     "id": "prompt_1",
-    #     "problem_statement": (
-    #         "Given a sequence of input vectors ({data_mode}, length {seq_len}) mapped to scalar binary outputs, "
-    #         "extract the underlying relationship as a concise Python function `f(x)`. "
-    #         "The solution must be a direct logical or mathematical expression, not a machine learning model."
-    #     )
-    # },
-    # {
-    #     "id": "prompt_2",
-    #     "problem_statement": (
-    #         "Analyze the provided input vectors ({data_mode}, length {seq_len}) and their corresponding binary outputs "
-    #         "to determine the governing logic. Express this logic as a short, deterministic Python function `f(x)` "
-    #         "using mathematical or logical operations, avoiding trainable parameters."
-    #     )
-    # },
-    # {
-    #     "id": "prompt_3",
-    #     "problem_statement": (
-    #         "Identify the mapping between the input vectors ({data_mode}, length {seq_len}) and binary scalar outputs. "
-    #         "Represent this mapping through a concise, stateless Python function `f(x)` that relies purely "
-    #         "on explicit mathematical or logical rules rather than learned weights."
-    #     )
-    # },
-    # {
-    #     "id": "prompt_4",
-    #     "problem_statement": (
-    #         "Discover the strict mathematical or logical rule that maps the input vectors ({data_mode}, length {seq_len}) "
-    #         "to their binary outputs. Output a concise Python function `f(x)` that formally encodes this rule "
-    #         "without relying on any trainable architecture."
-    #     )
-    # },
     {
-        "id": "prompt_5",
+        "id": "prompt_1",
         "problem_statement": (
-            "Derive a precise Python function `f(x)` that translates input vectors ({data_mode}, length {seq_len}) "
-            "into their observed binary scalar outputs. The resulting function must be explicitly defined "
-            "using standard logical or mathematical operations, strictly excluding trainable models."
+            "Given a sequence of input vectors ({data_mode}, length {seq_len}) mapped to scalar binary outputs, "
+            "extract the underlying relationship as a concise Python function `f(x)`. "
+            "The solution must be a direct logical or mathematical expression, not a machine learning model."
         )
-    }
+    },
+    {
+        "id": "prompt_2",
+        "problem_statement": (
+            "Analyze the provided input vectors ({data_mode}, length {seq_len}) and their corresponding binary outputs "
+            "to determine the governing logic. Express this logic as a short, deterministic Python function `f(x)` "
+            "using mathematical or logical operations, avoiding trainable parameters."
+        )
+    },
+    {
+        "id": "prompt_3",
+        "problem_statement": (
+            "Identify the mapping between the input vectors ({data_mode}, length {seq_len}) and binary scalar outputs. "
+            "Represent this mapping through a concise, stateless Python function `f(x)` that relies purely "
+            "on explicit mathematical or logical rules rather than learned weights."
+        )
+    },
+    {
+        "id": "prompt_4",
+        "problem_statement": (
+            "Discover the strict mathematical or logical rule that maps the input vectors ({data_mode}, length {seq_len}) "
+            "to their binary outputs. Output a concise Python function `f(x)` that formally encodes this rule "
+            "without relying on any trainable architecture."
+        )
+    },
 ]
 
 
