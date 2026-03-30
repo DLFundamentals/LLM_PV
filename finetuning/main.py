@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 import gc
+import time
 from typing import Dict, Any, Tuple, Callable
 import json
 
@@ -71,6 +72,12 @@ class Metrics:
     def __init__(self):
         self.train_losses, self.test_losses = [], []
         self.train_accuracies, self.test_accuracies = [], []
+        # Adaptation wall-clock = time until first measured epoch with train_acc == 1.0.
+        # -1 means "not reached within this run".
+        self.train_wall_clock_ms = -1
+        # Aggregate test-set evaluation wall-clock across evaluation checkpoints.
+        self.test_eval_wall_clock_ms = 0
+        self.total_wall_clock_ms = 0
 
     def update(self, train_loss, test_loss, train_acc, test_acc):
         self.train_losses.append(train_loss)
@@ -238,6 +245,8 @@ def load_model_and_optimizer(args, logger, train_loader):
 def run_training_loop(args, results_path, model, optimizer, scheduler, train_loader, test_loader, logger):
     """Executes the main training and evaluation loop."""
     metrics = Metrics()
+    total_t0 = time.perf_counter()
+    reached_train_acc_100 = False
     
     if args.precision in ['bf16', 'bfloat16']: amp_dtype = torch.bfloat16
     elif args.precision in ['f16', 'float16']: amp_dtype = torch.float16
@@ -248,13 +257,37 @@ def run_training_loop(args, results_path, model, optimizer, scheduler, train_loa
     for epoch in tqdm(range(1, args.n_epochs + 1), desc="Epochs"):
         if not args.online:
             if (epoch % 100 == 1) or (epoch == args.n_epochs):
+                train_eval_t0 = time.perf_counter()
                 train_loss, train_acc = evaluate_model(model, train_loader, args.device, args.model, amp_dtype)
+                train_eval_ms = int((time.perf_counter() - train_eval_t0) * 1000)
+
+                test_eval_t0 = time.perf_counter()
                 test_loss, test_acc = evaluate_model(model, test_loader, args.device, args.model, amp_dtype)
+                test_eval_ms = int((time.perf_counter() - test_eval_t0) * 1000)
+
                 metrics.update(train_loss, test_loss, train_acc, test_acc)
-                logger.info(f"Epoch {epoch:04d} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f}")
+                metrics.test_eval_wall_clock_ms += test_eval_ms
+                if (not reached_train_acc_100) and (train_acc >= 1.0):
+                    metrics.train_wall_clock_ms = int((time.perf_counter() - total_t0) * 1000)
+                    reached_train_acc_100 = True
+                logger.info(
+                    f"Epoch {epoch:04d} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f} "
+                    f"| train_eval_ms={train_eval_ms} | test_eval_ms={test_eval_ms}"
+                )
             
+            train_t0 = time.perf_counter()
             train_epoch(model, optimizer, scheduler, train_loader, args.device, len(train_loader), scaler, args.model, amp_dtype)
             utils.save_data(results_path, metrics)
+
+    metrics.total_wall_clock_ms = int((time.perf_counter() - total_t0) * 1000)
+    if not reached_train_acc_100:
+        logger.info("Train accuracy never reached 100%% during measured checkpoints; train_wall_clock_ms=-1")
+    logger.info(
+        "Wall-clock summary | train_ms=%d | test_eval_ms=%d | total_ms=%d",
+        metrics.train_wall_clock_ms,
+        metrics.test_eval_wall_clock_ms,
+        metrics.total_wall_clock_ms,
+    )
 
 def cleanup(*args):
     """Clears memory by deleting objects and emptying CUDA cache."""
