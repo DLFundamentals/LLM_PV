@@ -1,11 +1,6 @@
 """Agent baseline runner for program_synthesis tasks.
 
-Two agent baselines:
-  1. iterative_agent — calls OpenAI directly with runner.py-style prompts,
-     tests the code on validation data, and iterates with feedback.
-  2. mlagentbench   — uses the MLAgentBench autonomous research agent.
-
-Each trial logs every generated code attempt to <run_dir>/attempts/.
+This runner executes the MLAgentBench autonomous research agent baseline.
 """
 
 from __future__ import annotations
@@ -47,7 +42,6 @@ logger = logging.getLogger("agent_baseline_runner")
 
 @dataclass
 class Config:
-    agents: List[str] = field(default_factory=lambda: ["iterative_agent", "mlagentbench"])
     functions: List[str] = field(
         default_factory=lambda: [
             "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
@@ -62,8 +56,6 @@ class Config:
     seed: int = int(os.getenv("GLOBAL_SEED", "42"))
     num_trials: int = int(os.getenv("NUM_TRIALS", "5"))
     timeout_s: int = int(os.getenv("AGENT_TIMEOUT_S", "1800"))
-    agent_model: str = os.getenv("AGENT_MODEL", "gpt-4o")
-    agent_steps: int = int(os.getenv("AGENT_STEPS", "10"))
     mlab_max_steps: int = int(os.getenv("MLAB_MAX_STEPS", "30"))
     mlab_llm: str = os.getenv("MLAB_LLM", "gpt-4")
     dataset_dir: str = os.path.join(PROJECT_ROOT, os.getenv("DATASET_DIR", "program_synthesis/datasets"))
@@ -261,185 +253,6 @@ def _build_task_description(L: int, is_tabular: bool, train_lines: List[str]) ->
     )
 
 
-def _save_attempt(run_dir: str, step: int, code: str, val_acc: float,
-                  error: Optional[str]) -> None:
-    """Save each agent attempt for inspection."""
-    attempts_dir = os.path.join(run_dir, "attempts")
-    os.makedirs(attempts_dir, exist_ok=True)
-    meta = {"step": step, "val_acc": val_acc, "error": error}
-    with open(os.path.join(attempts_dir, f"step_{step:02d}.py"), "w") as f:
-        f.write(f"# val_acc={val_acc:.4f}  error={error}\n")
-        f.write(code)
-    with open(os.path.join(attempts_dir, f"step_{step:02d}.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Iterative OpenAI Agent — uses runner.py-style prompts + feedback loop
-# ---------------------------------------------------------------------------
-
-def _build_initial_prompt(L: int, is_tabular: bool, train_lines: List[str]) -> str:
-    """Same prompt style as runner.py's build_user_prompt."""
-    if is_tabular:
-        desc = (
-            f"Given tabular input data (comma-separated feature:value pairs) and "
-            f"their corresponding scalar binary outputs ('0' or '1'), find a concise "
-            f"Python function `f(x)` that accurately approximates the underlying relationship. "
-            f"The function should not be a trainable model, but a direct logical or "
-            f"mathematical representation of the target function."
-        )
-    else:
-        desc = (
-            f"Given a sequence of input vectors (binary, length {L}) and their "
-            f"corresponding scalar binary outputs ('0' or '1'), find a concise "
-            f"Python function `f(x)` that accurately approximates the underlying relationship. "
-            f"The function should not be a trainable model, but a direct logical or "
-            f"mathematical representation of the target function."
-        )
-    prompt = f"**Problem Statement:**\n{desc}\n\n"
-    prompt += "**Data Examples:**\n```\n" + "\n".join(train_lines) + "\n```\n\n"
-    prompt += (
-        'You must output ONLY a single JSON object: {"code": "<python function>"}.\n'
-        "The code must define a function `def f(x):` that takes a string x and returns 0 or 1.\n"
-    )
-    return prompt
-
-
-def _build_feedback_prompt(prev_code: str, val_acc: float, error: Optional[str],
-                           train_lines: List[str]) -> str:
-    """Send back accuracy/error so the model can iterate."""
-    prompt = "Your previous solution:\n```python\n" + prev_code + "\n```\n\n"
-    if error:
-        prompt += f"**Error:** {error}\n\n"
-    else:
-        prompt += f"**Validation accuracy:** {val_acc:.4f} ({int(val_acc*100)}% correct)\n\n"
-    prompt += (
-        "Please improve the function. Analyze the patterns in the data more carefully.\n\n"
-        "**Data Examples (reminder):**\n```\n" + "\n".join(train_lines[:30]) + "\n```\n\n"
-        'Output ONLY: {"code": "<improved python function>"}\n'
-    )
-    return prompt
-
-
-def _extract_code_from_response(text: str) -> str:
-    """Pull code out of the JSON or markdown response."""
-    text = text.strip()
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "code" in obj:
-            return obj["code"]
-    except json.JSONDecodeError:
-        pass
-
-    json_match = re.search(r'\{[^{}]*"code"\s*:\s*"(.*?)"[^{}]*\}', text, re.DOTALL)
-    if json_match:
-        try:
-            obj = json.loads(json_match.group(0))
-            return obj["code"]
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    code_match = re.search(r'```(?:python)?\s*\n(.*?)```', text, re.DOTALL)
-    if code_match:
-        return code_match.group(1).strip()
-
-    if "def f(" in text:
-        lines = text.split("\n")
-        code_lines = []
-        capture = False
-        for line in lines:
-            if line.strip().startswith("def f("):
-                capture = True
-            if capture:
-                code_lines.append(line)
-        if code_lines:
-            return "\n".join(code_lines)
-
-    return text
-
-
-def run_iterative_agent(
-    run_dir: str,
-    train_lines: List[str],
-    val_lines: List[str],
-    L: int,
-    is_tabular: bool,
-    model: str,
-    steps: int,
-) -> Tuple[str, float, List[Dict]]:
-    """Iterative agent: generate → test → feedback → improve.
-    Returns (best_code, best_val_acc, attempt_log)."""
-    import openai
-    client = openai.OpenAI()
-
-    best_code: Optional[str] = None
-    best_val_acc = 0.0
-    prev_code: Optional[str] = None
-    prev_acc = 0.0
-    prev_error: Optional[str] = None
-    attempt_log: List[Dict] = []
-
-    for step in range(steps):
-        if step == 0:
-            user_msg = _build_initial_prompt(L, is_tabular, train_lines)
-        else:
-            user_msg = _build_feedback_prompt(prev_code, prev_acc, prev_error, train_lines)
-
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": (
-                        "You are an expert at finding patterns in binary sequences. "
-                        "Output only valid JSON with a 'code' field containing a Python function def f(x)."
-                    )},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.5,
-                max_tokens=4096,
-            )
-            raw_text = response.choices[0].message.content or ""
-        except Exception as e:
-            logger.warning("  Step %d: API error: %s", step, e)
-            attempt_log.append({"step": step, "error": str(e), "code": None, "val_acc": 0.0})
-            continue
-
-        code_str = _extract_code_from_response(raw_text)
-        val_acc = 0.0
-        error_msg = None
-
-        try:
-            fn_callable = compile_callable_from_code(code_str, label=f"step{step}")
-            val_acc = evaluate_accuracy(fn_callable, val_lines, is_tabular)
-        except Exception as e:
-            error_msg = str(e)
-
-        _save_attempt(run_dir, step, code_str, val_acc, error_msg)
-        logger.info("    step %d: val_acc=%.4f%s", step, val_acc,
-                     f" error={error_msg}" if error_msg else "")
-
-        attempt_log.append({
-            "step": step, "val_acc": val_acc,
-            "error": error_msg, "code": code_str,
-        })
-
-        if val_acc > best_val_acc or best_code is None:
-            best_val_acc = val_acc
-            best_code = code_str
-
-        prev_code = code_str
-        prev_acc = val_acc
-        prev_error = error_msg
-
-        if val_acc >= 1.0:
-            logger.info("    Perfect accuracy at step %d, stopping early", step)
-            break
-
-    if best_code is None:
-        raise RuntimeError("Iterative agent produced no code across all steps")
-    return best_code, best_val_acc, attempt_log
-
-
 # ---------------------------------------------------------------------------
 # MLAgentBench agent
 # ---------------------------------------------------------------------------
@@ -596,10 +409,11 @@ class AgentBaselineRunner:
         self.cfg = cfg
 
     def _run_single_trial(
-        self, agent: str, fn: str, L: int, trial: int,
+        self, fn: str, L: int, trial: int,
         train_lines: List[str], val_lines: List[str], test_lines: List[str],
         is_tabular: bool,
     ) -> Dict[str, Any]:
+        agent = "mlagentbench"
         run_dir = _make_run_dir(self.cfg, agent, fn, L, trial)
         paths = _materialize_task(run_dir, L, is_tabular, train_lines, val_lines)
         task_desc = open(paths["task.md"], "r").read()
@@ -609,13 +423,7 @@ class AgentBaselineRunner:
         error = None
 
         try:
-            if agent == "iterative_agent":
-                code, _best_val, _log = run_iterative_agent(
-                    run_dir, train_lines, val_lines, L, is_tabular,
-                    model=self.cfg.agent_model,
-                    steps=self.cfg.agent_steps,
-                )
-            elif agent == "mlagentbench":
+            if agent == "mlagentbench":
                 code = run_mlagentbench(
                     run_dir, task_desc,
                     max_steps=self.cfg.mlab_max_steps,
@@ -675,53 +483,52 @@ class AgentBaselineRunner:
                 for L in self.cfg.lengths:
                     train_lines, val_lines, test_lines, target_name = get_or_create_splits(self.cfg, fn, L)
                     is_tabular = target_name in TABULAR_FNS
+                    agent = "mlagentbench"
+                    logger.info("=== %s | %s | L=%s ===", agent, fn, L)
+                    trial_results = []
 
-                    for agent in self.cfg.agents:
-                        logger.info("=== %s | %s | L=%s ===", agent, fn, L)
-                        trial_results = []
+                    for trial in range(self.cfg.num_trials):
+                        logger.info("  Trial %s/%s", trial + 1, self.cfg.num_trials)
+                        result = self._run_single_trial(
+                            fn, L, trial,
+                            train_lines, val_lines, test_lines, is_tabular,
+                        )
+                        trial_results.append(result)
+                        logger.info(
+                            "  -> status=%s val=%.4f test=%.4f dur=%dms",
+                            result["status"], result["val_acc"],
+                            result["test_acc"], result["duration_ms"],
+                        )
 
-                        for trial in range(self.cfg.num_trials):
-                            logger.info("  Trial %s/%s", trial + 1, self.cfg.num_trials)
-                            result = self._run_single_trial(
-                                agent, fn, L, trial,
-                                train_lines, val_lines, test_lines, is_tabular,
-                            )
-                            trial_results.append(result)
-                            logger.info(
-                                "  -> status=%s val=%.4f test=%.4f dur=%dms",
-                                result["status"], result["val_acc"],
-                                result["test_acc"], result["duration_ms"],
-                            )
+                    val_accs = [r["val_acc"] for r in trial_results]
+                    test_accs = [r["test_acc"] for r in trial_results]
+                    durations = [r["duration_ms"] for r in trial_results]
+                    errors = [r["error"] for r in trial_results if r["error"]]
+                    statuses = [r["status"] for r in trial_results]
 
-                        val_accs = [r["val_acc"] for r in trial_results]
-                        test_accs = [r["test_acc"] for r in trial_results]
-                        durations = [r["duration_ms"] for r in trial_results]
-                        errors = [r["error"] for r in trial_results if r["error"]]
-                        statuses = [r["status"] for r in trial_results]
-
-                        row = {
-                            "fn": fn,
-                            "length": L,
-                            "model": f"agent_{agent}",
-                            "duration_ms": int(np.sum(durations)),
-                            "adaptation_duration_ms": int(np.sum(durations)),
-                            "test_duration_ms": 0,
-                            "total_wall_clock_duration_ms": int(np.sum(durations)),
-                            "val_acc": float(np.mean(val_accs)),
-                            "val_acc_std": float(np.std(val_accs)),
-                            "test_acc": float(np.mean(test_accs)),
-                            "test_acc_std": float(np.std(test_accs)),
-                            "best_params": json.dumps({
-                                "statuses": statuses,
-                                "errors": errors[:5],
-                                "num_trials": self.cfg.num_trials,
-                            }),
-                            "best_cv_score": float(np.max(val_accs)),
+                    row = {
+                        "fn": fn,
+                        "length": L,
+                        "model": f"agent_{agent}",
+                        "duration_ms": int(np.sum(durations)),
+                        "adaptation_duration_ms": int(np.sum(durations)),
+                        "test_duration_ms": 0,
+                        "total_wall_clock_duration_ms": int(np.sum(durations)),
+                        "val_acc": float(np.mean(val_accs)),
+                        "val_acc_std": float(np.std(val_accs)),
+                        "test_acc": float(np.mean(test_accs)),
+                        "test_acc_std": float(np.std(test_accs)),
+                        "best_params": json.dumps({
+                            "statuses": statuses,
+                            "errors": errors[:5],
                             "num_trials": self.cfg.num_trials,
-                        }
-                        all_rows.append(row)
-                        jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        jsonl_file.flush()
+                        }),
+                        "best_cv_score": float(np.max(val_accs)),
+                        "num_trials": self.cfg.num_trials,
+                    }
+                    all_rows.append(row)
+                    jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    jsonl_file.flush()
         return all_rows
 
 
@@ -740,8 +547,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Agent baseline runner (iterative OpenAI + MLAgentBench)")
-    p.add_argument("--agents", nargs="*", help="Agents: iterative_agent, mlagentbench")
+    p = argparse.ArgumentParser(description="Agent baseline runner (MLAgentBench)")
     p.add_argument("--functions", nargs="*", help="Function IDs (fn_a ... fn_aa)")
     p.add_argument("--lengths", nargs="*", type=int, help="Lengths (default: 100)")
     p.add_argument("--train-size", type=int)
@@ -750,8 +556,6 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int)
     p.add_argument("--num-trials", type=int)
     p.add_argument("--timeout-s", type=int)
-    p.add_argument("--agent-model", type=str, help="Model for iterative agent (default: gpt-4o)")
-    p.add_argument("--agent-steps", type=int, help="Iterative agent improvement steps (default: 10)")
     p.add_argument("--mlab-max-steps", type=int, help="MLAgentBench max steps (default: 30)")
     p.add_argument("--mlab-llm", type=str, help="LLM for MLAgentBench (default: gpt-4)")
     p.add_argument("--dataset-dir")
@@ -761,7 +565,6 @@ def parse_args() -> Config:
     args = p.parse_args()
 
     cfg = Config()
-    if args.agents: cfg.agents = args.agents
     if args.functions: cfg.functions = args.functions
     if args.lengths: cfg.lengths = args.lengths
     if args.train_size: cfg.train_size = args.train_size
@@ -770,8 +573,6 @@ def parse_args() -> Config:
     if args.seed is not None: cfg.seed = args.seed
     if args.num_trials is not None: cfg.num_trials = args.num_trials
     if args.timeout_s is not None: cfg.timeout_s = args.timeout_s
-    if args.agent_model: cfg.agent_model = args.agent_model
-    if args.agent_steps is not None: cfg.agent_steps = args.agent_steps
     if args.mlab_max_steps is not None: cfg.mlab_max_steps = args.mlab_max_steps
     if args.mlab_llm: cfg.mlab_llm = args.mlab_llm
     if args.dataset_dir: cfg.dataset_dir = os.path.abspath(args.dataset_dir)
