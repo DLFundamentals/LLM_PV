@@ -621,7 +621,9 @@ class BaselineRunner:
                             
                             test_accuracies = []
                             val_accuracies = []
-                            durations = []
+                            adaptation_durations = []
+                            test_durations = []
+                            total_durations = []
                             all_best_params = []
                             
                             for trial in range(self.cfg.num_trials):
@@ -631,24 +633,27 @@ class BaselineRunner:
                                 base_model = get_base_models(trial_seed, include_ga=is_boolean, include_tabpfn=True)[model_name]
                                 param_grid = param_grids[model_name]
                                 
-                                t0 = time.perf_counter()
+                                trial_t0 = time.perf_counter()
+                                adaptation_t0 = time.perf_counter()
                                 
                                 if model_name == "tabpfn":
                                     base_model.fit(X_train, y_train)
                                     val_pred = base_model.predict(X_val)
-                                    test_pred = base_model.predict(X_test)
                                     best_val_acc = accuracy_score(y_val, val_pred)
-                                    test_acc = accuracy_score(y_test, test_pred)
                                     best_params = {}
                                     best_model = base_model
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+                                    test_t0 = time.perf_counter()
+                                    test_pred = best_model.predict(X_test)
+                                    test_acc = accuracy_score(y_test, test_pred)
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                 elif model_name == "genetic_algorithm":
                                     if is_tabular:
                                         binarizer = GABinarizer()
                                         X_train_ga = binarizer.fit_transform(X_train, parser.numeric_indices, parser.categorical_indices)
                                         X_val_ga = binarizer.transform(X_val, parser.numeric_indices, parser.categorical_indices)
-                                        X_test_ga = binarizer.transform(X_test, parser.numeric_indices, parser.categorical_indices)
                                     else:
-                                        X_train_ga, X_val_ga, X_test_ga = X_train, X_val, X_test
+                                        X_train_ga, X_val_ga = X_train, X_val
                                     
                                     best_val_acc = -1
                                     best_params = None
@@ -673,7 +678,14 @@ class BaselineRunner:
                                             best_params = params
                                             best_model = model
                                     
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+                                    test_t0 = time.perf_counter()
+                                    if is_tabular:
+                                        X_test_ga = binarizer.transform(X_test, parser.numeric_indices, parser.categorical_indices)
+                                    else:
+                                        X_test_ga = X_test
                                     test_acc = accuracy_score(y_test, best_model.predict(X_test_ga))
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                     
                                     # Track best GA model across trials (by test accuracy)
                                     task_key = (fn, L)
@@ -704,16 +716,18 @@ class BaselineRunner:
                                     grid_search.fit(X_train, y_train)
                                     best_model = grid_search.best_estimator_
                                     val_acc = accuracy_score(y_val, best_model.predict(X_val))
-                                    
+                                    best_params = grid_search.best_params_
+                                    best_val_acc = val_acc
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+
+                                    test_t0 = time.perf_counter()
                                     if is_tabular and model_name == "svm":
                                         test_subset_size = min(1000, len(X_test))
                                         test_indices = np.random.RandomState(trial_seed).choice(len(X_test), test_subset_size, replace=False)
                                         test_acc = accuracy_score(y_test[test_indices], best_model.predict(X_test[test_indices]))
                                     else:
                                         test_acc = accuracy_score(y_test, best_model.predict(X_test))
-                                    
-                                    best_params = grid_search.best_params_
-                                    best_val_acc = val_acc
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
 
                                     if model_name == "decision_tree":
                                         task_key = (fn, L)
@@ -730,20 +744,28 @@ class BaselineRunner:
                                                 "best_params": best_params,
                                             }
                                 
-                                duration_ms = int((time.perf_counter() - t0) * 1000)
+                                total_duration_ms = int((time.perf_counter() - trial_t0) * 1000)
                                 test_accuracies.append(test_acc)
                                 val_accuracies.append(best_val_acc)
-                                durations.append(duration_ms)
+                                adaptation_durations.append(adaptation_duration_ms)
+                                test_durations.append(test_duration_ms)
+                                total_durations.append(total_duration_ms)
                                 all_best_params.append(best_params)
                                 
-                                print(f"      Trial {trial+1}: test_acc={test_acc:.4f}, val_acc={best_val_acc:.4f}", flush=True)
+                                print(
+                                    f"      Trial {trial+1}: test_acc={test_acc:.4f}, val_acc={best_val_acc:.4f}, "
+                                    f"adapt_ms={adaptation_duration_ms}, test_ms={test_duration_ms}, total_ms={total_duration_ms}",
+                                    flush=True
+                                )
                             
                             # Compute statistics
                             test_acc_mean = float(np.mean(test_accuracies))
                             test_acc_std = float(np.std(test_accuracies))
                             val_acc_mean = float(np.mean(val_accuracies))
                             val_acc_std = float(np.std(val_accuracies))
-                            total_duration_ms = int(np.sum(durations))
+                            total_adaptation_duration_ms = int(np.sum(adaptation_durations))
+                            total_test_duration_ms = int(np.sum(test_durations))
+                            total_wall_clock_duration_ms = int(np.sum(total_durations))
                             
                             # Use first best_params (could use mode if needed)
                             best_params = all_best_params[0]
@@ -754,7 +776,10 @@ class BaselineRunner:
                                 "fn": fn,
                                 "length": L,
                                 "model": model_name,
-                                "duration_ms": total_duration_ms,
+                                "duration_ms": total_wall_clock_duration_ms,
+                                "adaptation_duration_ms": total_adaptation_duration_ms,
+                                "test_duration_ms": total_test_duration_ms,
+                                "total_wall_clock_duration_ms": total_wall_clock_duration_ms,
                                 "val_acc": val_acc_mean,
                                 "val_acc_std": val_acc_std,
                                 "test_acc": test_acc_mean,
@@ -809,7 +834,12 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
-    fieldnames = ["fn", "length", "model", "duration_ms", "val_acc", "val_acc_std", "test_acc", "test_acc_std", "best_params", "best_cv_score", "num_trials"]
+    fieldnames = [
+        "fn", "length", "model",
+        "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
+        "val_acc", "val_acc_std", "test_acc", "test_acc_std",
+        "best_params", "best_cv_score", "num_trials"
+    ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()

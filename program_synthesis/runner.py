@@ -31,7 +31,7 @@
 # =====================================================================================
 
 from __future__ import annotations
-import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, shutil, hashlib
+import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, hashlib, inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
@@ -117,6 +117,49 @@ def normalize_usage(usage_obj) -> Dict[str, Any]:
     return u
 
 
+def normalize_gemini_usage(usage_obj: Any) -> Dict[str, Any]:
+    if usage_obj is None:
+        return {}
+    # google-genai returns usage metadata as attributes.
+    usage: Dict[str, Any] = {
+        "prompt_tokens": getattr(usage_obj, "prompt_token_count", None),
+        "completion_tokens": getattr(usage_obj, "candidates_token_count", None),
+        "total_tokens": getattr(usage_obj, "total_token_count", None),
+        "reasoning_tokens": getattr(usage_obj, "thoughts_token_count", None),
+    }
+    cached_tokens = getattr(usage_obj, "cached_content_token_count", None)
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        usage["cached_tokens"] = cached_tokens
+    return {k: v for k, v in usage.items() if v is not None}
+
+
+def normalize_anthropic_usage(usage_obj: Any) -> Dict[str, Any]:
+    if usage_obj is None:
+        return {}
+    if isinstance(usage_obj, Mapping):
+        usage: Dict[str, Any] = {
+            "prompt_tokens": usage_obj.get("input_tokens"),
+            "completion_tokens": usage_obj.get("output_tokens"),
+            "cached_tokens": usage_obj.get("cache_read_input_tokens"),
+        }
+        if usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        if usage.get("cached_tokens") is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+        return {k: v for k, v in usage.items() if v is not None}
+    usage: Dict[str, Any] = {
+        "prompt_tokens": getattr(usage_obj, "input_tokens", None),
+        "completion_tokens": getattr(usage_obj, "output_tokens", None),
+        "cached_tokens": getattr(usage_obj, "cache_read_input_tokens", None),
+    }
+    if usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
+        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    if usage.get("cached_tokens") is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+    return {k: v for k, v in usage.items() if v is not None}
+
+
 # =========================
 # Logging
 # =========================
@@ -158,12 +201,25 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
 @dataclass
 class Config:
     api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    provider: str = os.getenv("PROVIDER", "auto")
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
+    thinking_level: str = os.getenv("THINKING_LEVEL", os.getenv("REASONING_EFFORT", "high"))
+    gemini_api_version: str = os.getenv("GEMINI_API_VERSION", "v1beta")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
+    temperature: Optional[float] = field(default_factory=lambda: float(os.getenv("TEMPERATURE")) if os.getenv("TEMPERATURE") else None)
+    top_p: Optional[float] = field(default_factory=lambda: float(os.getenv("TOP_P")) if os.getenv("TOP_P") else None)
     tool_choice: str = os.getenv("TOOL_CHOICE", "auto")
+    allow_tools: bool = os.getenv("ALLOW_TOOLS", "1") == "1"
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
+    anthropic_max_tokens: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "40000"))
+    hf_device_map: str = os.getenv("HF_DEVICE_MAP", "auto")
+    hf_torch_dtype: str = os.getenv("HF_TORCH_DTYPE", "auto")
+    hf_trust_remote_code: bool = os.getenv("HF_TRUST_REMOTE_CODE", "1") == "1"
+    hf_attn_implementation: Optional[str] = os.getenv("HF_ATTN_IMPLEMENTATION")
 
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
@@ -175,6 +231,7 @@ class Config:
         "fn_m", "fn_n", "fn_o", "fn_p", "fn_q", "fn_aa",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
+    lengths_explicit: bool = False
     attempts: int = int(os.getenv("ATTEMPTS", "5"))
     num_trials: int = int(os.getenv("NUM_TRIALS", "5"))
 
@@ -192,7 +249,13 @@ class Config:
 # Prompt
 # =========================
 
-def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = False, tabular: bool = False) -> str:
+def build_user_prompt(
+    data_examples: List[str],
+    seq_len: int,
+    decimal: bool = False,
+    tabular: bool = False,
+    strict_json_only: bool = False,
+) -> str:
     if tabular:
         problem_statement = (
             f"**Problem Statement:**\n"
@@ -216,7 +279,12 @@ def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = Fa
         )
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.'
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.\n'
+    if strict_json_only:
+        prompt += (
+            "Do NOT include analysis, reasoning, markdown, or prose.\n"
+            "Return the JSON immediately. If uncertain, still return your best single function."
+        )
     return prompt
 
 
@@ -367,20 +435,83 @@ class DatasetStore:
 def extract_code_from_output(output_text: str) -> Optional[str]:
     if not output_text:
         return None
-    try:
-        obj = json.loads(output_text)
-        if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
+
+    def _extract_def_block(text: str) -> Optional[str]:
+        m = re.search(r"(def\s+[A-Za-z_]\w*\s*\([^)]*\)\s*:[^\n]*\n?)", text)
+        if not m:
+            return None
+        rest = text[m.start():]
+        lines = rest.splitlines()
+        if not lines:
+            return None
+        collected = [lines[0]]
+        # Collect only the function body (indented lines) and blank lines.
+        for ln in lines[1:]:
+            if not ln.strip():
+                collected.append(ln)
+                continue
+            if ln.startswith((" ", "\t")):
+                collected.append(ln)
+                continue
+            break
+        return "\n".join(collected).strip() or None
+
+    def _extract_code_obj(obj: Any) -> Optional[str]:
+        if isinstance(obj, dict) and isinstance(obj.get("code"), str):
             return obj["code"]
+        return None
+
+    try:
+        code = _extract_code_obj(json.loads(output_text))
+        if code is not None:
+            return code
     except Exception:
         pass
-    m = re.search(r"\{.*\}", output_text, flags=re.DOTALL)
+
+    # Prefer the last valid JSON object containing {"code": "..."} in the text.
+    decoder = json.JSONDecoder()
+    best_code: Optional[str] = None
+    for i, ch in enumerate(output_text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(output_text[i:])
+            code = _extract_code_obj(obj)
+            if code is not None:
+                best_code = code
+        except Exception:
+            continue
+    if best_code is not None:
+        return best_code
+
+    # Final fallback for partially noisy outputs containing a JSON-looking code field.
+    m = re.search(r'\{\s*"code"\s*:\s*"(?:\\.|[^"\\])*"\s*\}', output_text, flags=re.DOTALL)
     if m:
         try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
-                return obj["code"]
+            code = _extract_code_obj(json.loads(m.group(0)))
+            if code is not None:
+                return code
         except Exception:
-            return None
+            pass
+
+    # If a model emits internal thinking tags, prioritize the final segment.
+    if "</think>" in output_text:
+        tail = output_text.rsplit("</think>", 1)[-1].strip()
+        if tail:
+            code = extract_code_from_output(tail)
+            if code is not None:
+                return code
+
+    # Fallback: accept fenced Python code containing a function definition.
+    for block in re.findall(r"```(?:python)?\s*([\s\S]*?)```", output_text, flags=re.IGNORECASE):
+        code = _extract_def_block(block)
+        if code is not None:
+            return code
+
+    # Last fallback: accept a raw `def ...` block from plain text outputs.
+    code = _extract_def_block(output_text)
+    if code is not None:
+        return code
     return None
 
 def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
@@ -482,34 +613,262 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
 # =========================
 
 class Runner:
+    @staticmethod
+    def _resolve_provider(provider: str, model: str) -> str:
+        requested = (provider or "auto").strip().lower()
+        if requested in {"openai", "gemini", "anthropic", "huggingface"}:
+            return requested
+        model_l = (model or "").strip().lower()
+        if model_l.startswith("gemini-") or model_l.startswith("models/gemini"):
+            return "gemini"
+        if model_l.startswith("claude-"):
+            return "anthropic"
+        if (
+            model_l.startswith("qwen/")
+            or model_l.startswith("allenai/")
+            or model_l.startswith("deepseek-ai/")
+            or model_l.startswith("deepseek/")
+        ):
+            return "huggingface"
+        return "openai"
+
     def __init__(self, cfg: Config, logger: logging.Logger):
-        if not cfg.api_key:
-            raise SystemExit("OPENAI_API_KEY is required.")
         self.cfg = cfg
         self.log = logger
-        self.client = AsyncOpenAI(api_key=cfg.api_key)
+        self.provider = self._resolve_provider(cfg.provider, cfg.model)
+        self.client: Optional[AsyncOpenAI] = None
+        self.gemini_client = None
+        self.anthropic_client = None
+        self.hf_model = None
+        self._anthropic_tool_choice_warned = False
+        self._anthropic_verbosity_warned = False
+        self._anthropic_timeout_logged = False
+        self._anthropic_thinking_warned = False
+        self._anthropic_tool_use_unhandled_warned = False
+        if self.provider == "openai":
+            if not cfg.api_key:
+                raise SystemExit("OPENAI_API_KEY is required.")
+            self.client = AsyncOpenAI(api_key=cfg.api_key)
+            self.log.info("openai_provider_enabled", extra={"model": cfg.model})
+        elif self.provider == "gemini":
+            if not cfg.gemini_api_key:
+                raise SystemExit("GEMINI_API_KEY is required for Gemini models.")
+            try:
+                from google import genai
+            except ImportError as e:
+                raise SystemExit("Gemini support requires `google-genai`. Install with: pip install google-genai") from e
+            self.gemini_client = genai.Client(
+                api_key=cfg.gemini_api_key,
+                http_options={"api_version": cfg.gemini_api_version},
+            )
+            self.log.info("gemini_provider_enabled", extra={"model": cfg.model, "api_version": cfg.gemini_api_version})
+        elif self.provider == "huggingface":
+            try:
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.engine.async_llm_engine import AsyncLLMEngine
+            except ImportError as e:
+                raise SystemExit(
+                    "vLLM support requires `vllm`. "
+                    "Install with: pip install vllm"
+                ) from e
+
+            engine_kwargs: Dict[str, Any] = {
+                "model": cfg.model,
+                "tensor_parallel_size": 1,
+                "trust_remote_code": cfg.hf_trust_remote_code,
+                "dtype": cfg.hf_torch_dtype if cfg.hf_torch_dtype in ["auto", "half", "float16", "bfloat16", "float32"] else "auto",
+                # Available only in newer vLLM versions.
+                "disable_log_requests": True,
+            }
+            supported = set(inspect.signature(AsyncEngineArgs.__init__).parameters.keys())
+            filtered_engine_kwargs = {k: v for k, v in engine_kwargs.items() if k in supported}
+            dropped_engine_kwargs = sorted(set(engine_kwargs.keys()) - set(filtered_engine_kwargs.keys()))
+
+            engine_args = AsyncEngineArgs(**filtered_engine_kwargs)
+            self.hf_model = AsyncLLMEngine.from_engine_args(engine_args)
+            self.log.info(
+                "vllm_provider_enabled",
+                extra={
+                    "model": cfg.model,
+                    "hf_torch_dtype": cfg.hf_torch_dtype,
+                    "hf_trust_remote_code": cfg.hf_trust_remote_code,
+                    "dropped_vllm_engine_args": dropped_engine_kwargs,
+                },
+            )
+        else:
+            if not cfg.anthropic_api_key:
+                raise SystemExit("ANTHROPIC_API_KEY is required for Claude models.")
+            try:
+                from anthropic import AsyncAnthropic
+            except ImportError as e:
+                raise SystemExit("Claude support requires `anthropic`. Install with: pip install anthropic") from e
+            self.anthropic_client = AsyncAnthropic(api_key=cfg.anthropic_api_key)
+            self.log.info("anthropic_provider_enabled", extra={"model": cfg.model})
         self.sem = asyncio.Semaphore(cfg.concurrency)
 
         self.tools: List[Dict[str, Any]] = []
+        self.anthropic_tools: List[Dict[str, Any]] = []
+        if self.provider == "anthropic":
+            self.anthropic_tools = [
+                {"type": "web_search_20260209", "name": "web_search"},
+                {"type": "web_fetch_20260209", "name": "web_fetch"},
+                {"type": "bash_20250124", "name": "bash"},
+            ]
         if cfg.enable_code_interpreter:
-            self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+            if self.provider == "anthropic":
+                # Claude server tool for sandboxed code execution.
+                self.anthropic_tools.append({"type": "code_execution_20250522", "name": "code_execution"})
+                
+            else:
+                self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+            if self.provider == "gemini":
+                self.log.warning("gemini_ignoring_code_interpreter_tool", extra={"model": cfg.model})
 
         self.ds = DatasetStore(cfg, logger)
 
+    def _gemini_generate_content_sync(self, body: Dict[str, Any]) -> Any:
+        if self.gemini_client is None:
+            raise RuntimeError("Gemini client is not initialized.")
+        return self.gemini_client.models.generate_content(**body)
+
+    async def _gemini_generate_content(self, body: Dict[str, Any]) -> Any:
+        return await asyncio.to_thread(self._gemini_generate_content_sync, body)
+
+    @staticmethod
+    def _extract_text_from_gemini_response(res: Any) -> str:
+        txt = (getattr(res, "text", "") or "").strip()
+        if txt:
+            return txt
+        chunks: List[str] = []
+        for cand in (getattr(res, "candidates", []) or []):
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", []) or []):
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+        return "\n".join(chunks).strip()
+
+    @staticmethod
+    def _extract_text_from_anthropic_response(res: Any) -> str:
+        chunks: List[str] = []
+        content = res.get("content", []) if isinstance(res, Mapping) else getattr(res, "content", []) or []
+        for block in content:
+            if isinstance(block, Mapping):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    chunks.append(block["text"])
+            else:
+                if getattr(block, "type", None) == "text":
+                    txt = getattr(block, "text", None)
+                    if isinstance(txt, str):
+                        chunks.append(txt)
+        return "".join(chunks).strip()
+
+    async def _anthropic_messages_create_sdk(self, body: Dict[str, Any]) -> Any:
+        if self.anthropic_client is None:
+            raise RuntimeError("Anthropic client is not initialized.")
+        # Use streaming for long Claude requests, then return a normal Message object.
+        async with self.anthropic_client.messages.stream(**body) as stream:
+            return await stream.get_final_message()
+
+    @staticmethod
+    def _format_exception(e: Exception) -> str:
+        msg = str(e).strip()
+        return msg if msg else e.__class__.__name__
+
+    async def aclose(self) -> None:
+        if self.client is not None:
+            await self.client.close()
+        if self.anthropic_client is not None:
+            close_fn = getattr(self.anthropic_client, "close", None)
+            if callable(close_fn):
+                maybe_awaitable = close_fn()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+
     async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
-        prompt_text = build_user_prompt(data_examples, L, decimal, tabular)
-        body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
-        body: Dict[str, Any] = {
-            "model": self.cfg.model,
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-            "reasoning": {"effort": self.cfg.reasoning_effort},
-            "max_output_tokens": self.cfg.max_output_tokens,
-            "tool_choice": self.cfg.tool_choice,
-        }
-        if self.tools:
-            body["tools"] = self.tools
-        if self.cfg.verbosity:
-            body["text"] = {"verbosity": self.cfg.verbosity}
+        prompt_text = build_user_prompt(
+            data_examples,
+            L,
+            decimal,
+            tabular,
+            strict_json_only=(self.provider == "huggingface"),
+        )
+        body_preview_size = len(prompt_text)
+        if self.provider == "openai":
+            openai_tool_choice = "auto" if self.cfg.allow_tools else "none"
+            body: Dict[str, Any] = {
+                "model": self.cfg.model,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
+                "reasoning": {"effort": self.cfg.reasoning_effort},
+                "max_output_tokens": self.cfg.max_output_tokens,
+                "tool_choice": openai_tool_choice,
+            }
+            if self.cfg.temperature is not None:
+                body["temperature"] = self.cfg.temperature
+            if self.cfg.top_p is not None:
+                body["top_p"] = self.cfg.top_p
+            if self.cfg.allow_tools and self.tools:
+                body["tools"] = self.tools
+            if self.cfg.verbosity:
+                body["text"] = {"verbosity": self.cfg.verbosity}
+        elif self.provider == "gemini":
+            gemini_tools: List[Dict[str, Any]] = []
+            if self.cfg.tool_choice != "none":
+                # Use Gemini built-in tools in a single-call flow.
+                gemini_tools = [
+                    {"google_search": {}},
+                    {"url_context": {}},
+                    {"code_execution": {}},
+                ]
+            body = {
+                "model": self.cfg.model,
+                "contents": prompt_text,
+                "config": {
+                    # Keep JSON-formatted output contract consistent with GPT-5 runs.
+                    "response_mime_type": "application/json",
+                    "max_output_tokens": self.cfg.max_output_tokens,
+                    "thinking_config": {"thinking_level": self.cfg.thinking_level},
+                    "tools": gemini_tools,
+                },
+            }
+            if self.cfg.temperature is not None:
+                body["config"]["temperature"] = self.cfg.temperature
+            if self.cfg.top_p is not None:
+                body["config"]["top_p"] = self.cfg.top_p
+            if self.cfg.tool_choice not in ("auto", "none"):
+                self.log.warning("gemini_tool_choice_not_supported", extra={"tool_choice": self.cfg.tool_choice})
+        elif self.provider == "huggingface":
+            body = {
+                "model": self.cfg.model,
+                "prompt": prompt_text,
+                "max_new_tokens": self.cfg.max_output_tokens,
+                "temperature": self.cfg.temperature,
+                "top_p": self.cfg.top_p,
+            }
+        else:
+            body = {
+                "model": "claude-opus-4-5-20251101",
+                "max_tokens": self.cfg.anthropic_max_tokens,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 20000,
+                },
+            }
+            if self.cfg.temperature is not None:
+                body["temperature"] = self.cfg.temperature
+            if self.cfg.top_p is not None:
+                body["top_p"] = self.cfg.top_p
+            if self.anthropic_tools:
+                body["tools"] = self.anthropic_tools
+            if self.cfg.tool_choice == "auto":
+                body["tool_choice"] = {"type": "auto"}
+            elif self.cfg.tool_choice not in ("auto", "none") and not self._anthropic_tool_choice_warned:
+                self.log.warning("anthropic_tool_choice_not_supported", extra={"tool_choice": self.cfg.tool_choice})
+                self._anthropic_tool_choice_warned = True
+            if self.cfg.verbosity and self.cfg.verbosity != "low" and not self._anthropic_verbosity_warned:
+                self.log.warning("anthropic_ignoring_verbosity", extra={"verbosity": self.cfg.verbosity})
+                self._anthropic_verbosity_warned = True
 
         if self.cfg.dry_run:
             self.log.info("dry_run_input", extra={"fn": fn, "length": L, "attempt": attempt_idx, "prompt_preview": prompt_text})
@@ -522,36 +881,147 @@ class Runner:
         async def _try_call(tag: str):
             t0 = time.perf_counter()
             async with self.sem:
-                res = await asyncio.wait_for(
-                    self.client.responses.create(**body),
-                    timeout=self.cfg.per_call_timeout_s,
-                )
-                tool_uses = 0
-                tool_results_chars = 0
-                for item in getattr(res, "output", []) or []:
-                    t = getattr(item, "type", None)
-                    if t == "tool_use":
-                        tool_uses += 1
-                    elif t == "tool_result":
-                        content = getattr(item, "content", None)
-                        if isinstance(content, list):
-                            for part in content:
-                                txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
-                                if isinstance(txt, str):
-                                    tool_results_chars += len(txt)
-                        elif isinstance(content, str):
-                            tool_results_chars += len(content)
+                if self.provider == "openai":
+                    if self.client is None:
+                        raise RuntimeError("OpenAI client is not initialized.")
+                    res = await asyncio.wait_for(
+                        self.client.responses.create(**body),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    tool_uses = 0
+                    tool_results_chars = 0
+                    for item in getattr(res, "output", []) or []:
+                        t = getattr(item, "type", None)
+                        if t == "tool_use":
+                            tool_uses += 1
+                        elif t == "tool_result":
+                            content = getattr(item, "content", None)
+                            if isinstance(content, list):
+                                for part in content:
+                                    txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+                                    if isinstance(txt, str):
+                                        tool_results_chars += len(txt)
+                            elif isinstance(content, str):
+                                tool_results_chars += len(content)
+                    usage = normalize_usage(getattr(res, "usage", {}))
+                    out_text = (getattr(res, "output_text", "") or "").strip()
+                elif self.provider == "gemini":
+                    res = await asyncio.wait_for(
+                        self._gemini_generate_content(body),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    usage = normalize_gemini_usage(getattr(res, "usage_metadata", None))
+                    out_text = self._extract_text_from_gemini_response(res)
+                    tool_uses = 0
+                    tool_results_chars = 0
+                elif self.provider == "huggingface":
+                    if self.hf_model is None:
+                        raise RuntimeError("vLLM engine is not initialized.")
+                    import uuid
+                    from vllm import SamplingParams
+
+                    request_id = str(uuid.uuid4())
+                    sampling_params = SamplingParams(
+                        max_tokens=self.cfg.max_output_tokens,
+                        temperature=self.cfg.temperature if self.cfg.temperature is not None else 0.0,
+                        top_p=self.cfg.top_p if self.cfg.top_p is not None else 1.0,
+                    )
+
+                    async def _generate_vllm() -> Any:
+                        final_output = None
+                        async for request_output in self.hf_model.generate(prompt_text, sampling_params, request_id):
+                            final_output = request_output
+                        return final_output
+
+                    final_output = await asyncio.wait_for(
+                        _generate_vllm(),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    if final_output is None or not final_output.outputs:
+                        raise RuntimeError("vLLM returned no output.")
+
+                    out_text = final_output.outputs[0].text.strip()
+                    if "</think>" in out_text:
+                        tail = out_text.rsplit("</think>", 1)[-1].strip()
+                        if tail:
+                            out_text = tail
+
+                    usage = {
+                        "prompt_tokens": len(final_output.prompt_token_ids or []),
+                        "completion_tokens": len(final_output.outputs[0].token_ids or []),
+                    }
+                    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                    tool_uses = 0
+                    tool_results_chars = 0
+                else:
+                    if self.anthropic_client is None:
+                        raise RuntimeError("Anthropic client is not initialized.")
+                    anthropic_timeout_s = min(float(self.cfg.per_call_timeout_s), 600.0)
+                    if anthropic_timeout_s < float(self.cfg.per_call_timeout_s) and not self._anthropic_timeout_logged:
+                        self.log.info(
+                            "anthropic_timeout_capped",
+                            extra={
+                                "configured_timeout_s": self.cfg.per_call_timeout_s,
+                                "effective_timeout_s": anthropic_timeout_s,
+                            },
+                        )
+                        self._anthropic_timeout_logged = True
+                    try:
+                        res = await asyncio.wait_for(
+                            self._anthropic_messages_create_sdk(body),
+                            timeout=anthropic_timeout_s,
+                        )
+                    except Exception as e:
+                        err = self._format_exception(e)
+                        fallback_body = dict(body)
+                        fallback_body.pop("tools", None)
+                        fallback_body.pop("tool_choice", None)
+                        self.log.warning(
+                            "anthropic_sdk_fallback_no_tools",
+                            extra={"error": err},
+                        )
+                        res = await asyncio.wait_for(
+                            self._anthropic_messages_create_sdk(fallback_body),
+                            timeout=anthropic_timeout_s,
+                        )
+
+                    usage_obj = res.get("usage") if isinstance(res, Mapping) else getattr(res, "usage", None)
+                    usage = normalize_anthropic_usage(usage_obj)
+                    out_text = self._extract_text_from_anthropic_response(res)
+                    stop_reason = res.get("stop_reason") if isinstance(res, Mapping) else getattr(res, "stop_reason", None)
+                    if stop_reason == "tool_use" and not self._anthropic_tool_use_unhandled_warned:
+                        self.log.warning(
+                            "anthropic_tool_use_requires_client_loop",
+                            extra={
+                                "model": self.cfg.model,
+                                "hint": "If using client tools, execute tool_use blocks and send tool_result blocks in a follow-up call.",
+                            },
+                        )
+                        self._anthropic_tool_use_unhandled_warned = True
+                    content_blocks = (res.get("content", []) or []) if isinstance(res, Mapping) else (getattr(res, "content", []) or [])
+                    tool_uses = sum(
+                        1 for block in content_blocks
+                        if (
+                            (isinstance(block, Mapping) and block.get("type") == "tool_use")
+                            or (not isinstance(block, Mapping) and getattr(block, "type", None) == "tool_use")
+                        )
+                    )
+                    tool_results_chars = 0
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
-            usage = normalize_usage(getattr(res, "usage", {}))
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-            out_text = (getattr(res, "output_text", "") or "").strip()
+            if self.provider == "anthropic":
+                active_tool_count = len(self.anthropic_tools)
+            elif self.provider == "openai":
+                active_tool_count = len(self.tools) if self.cfg.allow_tools else 0
+            else:
+                active_tool_count = len(self.tools)
             self.log.info(tag, extra={
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "duration_ms": dt_ms, "prompt_chars": len(prompt_text),
                 "request_body_bytes": len(json.dumps(body)),
                 "input_section_bytes": body_preview_size,
-                "tools_enabled": bool(self.tools), "tool_count": len(self.tools),
+                "tools_enabled": active_tool_count > 0, "tool_count": active_tool_count,
                 "tool_uses": tool_uses, "tool_results_chars": tool_results_chars,
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
@@ -572,12 +1042,16 @@ class Runner:
         try:
             return await _try_call("attempt_ok")
         except Exception as e1:
-            self.log.warning("attempt_retry_once", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e1)})
+            self.log.warning(
+                "attempt_retry_once",
+                extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": self._format_exception(e1)},
+            )
             try:
                 return await _try_call("attempt_ok_after_retry")
             except Exception as e2:
-                self.log.error("attempt_failed", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e2)})
-                return {"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e2)}
+                err = self._format_exception(e2)
+                self.log.error("attempt_failed", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": err})
+                return {"fn": fn, "length": L, "attempt": attempt_idx, "error": err}
 
     async def run(self) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
@@ -595,7 +1069,8 @@ class Runner:
                     continue
                 
                 task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
-                current_lengths = task_meta.get("lengths", self.cfg.lengths)
+                # If user passed --lengths explicitly, honor that exactly.
+                current_lengths = self.cfg.lengths if self.cfg.lengths_explicit else task_meta.get("lengths", self.cfg.lengths)
                 for L in current_lengths:
                     train_lines, val_lines, test_lines, is_decimal, is_tabular = self.ds.get(fn, L)
 
@@ -614,25 +1089,34 @@ class Runner:
                             stopped_early = False
 
                             for k in range(1, self.cfg.attempts + 1):
+                                attempt_t0 = time.perf_counter()
+                                learning_t0 = time.perf_counter()
                                 res = await self._call_once(fn, L, k, train_lines, is_decimal, is_tabular)
+                                learning_duration_ms = int((time.perf_counter() - learning_t0) * 1000)
                                 out_text = res.get("text") or ""
                                 code_str = extract_code_from_output(out_text)
 
                                 val_acc = None
                                 test_acc = None
                                 compile_error = None
+                                test_duration_ms = 0
 
                                 if code_str:
                                     try:
                                         fn_callable = compile_callable_from_code(code_str)
                                         val_acc = evaluate_accuracy(fn_callable, val_lines, self.log, is_tabular)
+                                        test_t0 = time.perf_counter()
                                         test_acc = evaluate_accuracy(fn_callable, test_lines, self.log, is_tabular)
+                                        test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                         
                                         if test_acc > best_test_acc:
                                             best_test_acc = test_acc
                                             best_val_acc = val_acc
                                             best_row = {
                                                 **res,
+                                                "adaptation_duration_ms": learning_duration_ms,
+                                                "test_duration_ms": test_duration_ms,
+                                                "total_wall_clock_duration_ms": int((time.perf_counter() - attempt_t0) * 1000),
                                                 "val_acc": val_acc,
                                                 "test_acc": test_acc,
                                                 "stopped_early": stopped_early,
@@ -650,8 +1134,12 @@ class Runner:
                                 else:
                                     compile_error = "no_code_found"
 
+                                total_wall_clock_duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
                                 row = {
                                     **res,
+                                    "adaptation_duration_ms": learning_duration_ms,
+                                    "test_duration_ms": test_duration_ms,
+                                    "total_wall_clock_duration_ms": total_wall_clock_duration_ms,
                                     "val_acc": val_acc,
                                     "test_acc": test_acc,
                                     "stopped_early": stopped_early,
@@ -693,6 +1181,9 @@ class Runner:
                             "prompt": None,
                             "text": None,
                             "duration_ms": None,
+                            "adaptation_duration_ms": None,
+                            "test_duration_ms": None,
+                            "total_wall_clock_duration_ms": None,
                             "cached_tokens": None,
                             "usage": {},
                             "tool_uses": None,
@@ -735,7 +1226,8 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "fn", "length", "attempt", "trial", "prompt", "text",
-        "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
+        "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
+        "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std", "stopped_early", "compile_error", "num_trials", "is_summary",
     ]
@@ -752,6 +1244,9 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "prompt": r.get("prompt"),
                 "text": r.get("text"),
                 "duration_ms": r.get("duration_ms"),
+                "adaptation_duration_ms": r.get("adaptation_duration_ms"),
+                "test_duration_ms": r.get("test_duration_ms"),
+                "total_wall_clock_duration_ms": r.get("total_wall_clock_duration_ms"),
                 "cached_tokens": r.get("cached_tokens"),
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
@@ -774,7 +1269,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
 # =========================
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="OpenAI runner (early-stop + persistent datasets)")
+    p = argparse.ArgumentParser(description="LLM runner (OpenAI/Gemini/Claude, early-stop + persistent datasets)")
 
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths (e.g., 100 50 30 25 20)")
@@ -783,12 +1278,22 @@ def parse_args() -> Config:
     p.add_argument("--concurrency", type=int, help="Max concurrent API calls (default: 5)")
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
 
+    p.add_argument("--provider", choices=["auto", "openai", "gemini", "anthropic", "huggingface"], help="Inference provider (default: auto)")
     p.add_argument("--model", help="Model name (default: gpt-5)")
+    p.add_argument("--temperature", type=float, help="Sampling temperature used across providers")
+    p.add_argument("--top-p", type=float, help="Nucleus sampling top_p used across providers")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
+    p.add_argument("--allow-tools", dest="allow_tools", action="store_true", help="Allow tool use for OpenAI provider")
+    p.add_argument("--no-tools", dest="allow_tools", action="store_false", help="Disable all tool use for OpenAI provider")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
     p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
+    p.add_argument("--thinking-level", choices=["minimal","low","medium","high"], help="Gemini thinking level (default: high)")
+    p.add_argument("--hf-device-map", help="Hugging Face device_map (default: auto)")
+    p.add_argument("--hf-torch-dtype", choices=["auto", "float16", "bfloat16", "float32"], help="Hugging Face torch_dtype (default: auto)")
+    p.add_argument("--no-hf-trust-remote-code", action="store_true", help="Disable trust_remote_code for Hugging Face model loading")
+    p.add_argument("--hf-attn-implementation", help="Optional Hugging Face attention backend (e.g. flash_attention_2)")
 
     p.add_argument("--train-size", type=int, help="Train size per (fn, L) (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size per (fn, L) (default: 100)")
@@ -801,22 +1306,38 @@ def parse_args() -> Config:
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
 
+    p.set_defaults(allow_tools=None)
     args = p.parse_args()
     cfg = Config()
 
     if args.functions: cfg.functions = args.functions
-    if args.lengths: cfg.lengths = args.lengths
+    if args.lengths:
+        cfg.lengths = args.lengths
+        cfg.lengths_explicit = True
     if args.attempts: cfg.attempts = args.attempts
     if args.num_trials: cfg.num_trials = args.num_trials
     if args.concurrency: cfg.concurrency = args.concurrency
+    if args.provider: cfg.provider = args.provider
     if args.model: cfg.model = args.model
+    if args.temperature is not None: cfg.temperature = args.temperature
+    if args.top_p is not None: cfg.top_p = args.top_p
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
     if args.enable_code_interpreter: cfg.enable_code_interpreter = True
+    if args.allow_tools is not None: cfg.allow_tools = args.allow_tools
     if args.tool_choice: cfg.tool_choice = args.tool_choice
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
     if args.verbosity: cfg.verbosity = args.verbosity
-    if args.reasoning_effort: cfg.reasoning_effort = args.reasoning_effort
+    if args.reasoning_effort:
+        cfg.reasoning_effort = args.reasoning_effort
+        # Keep Gemini thinking aligned with OpenAI-style reasoning unless explicitly overridden.
+        if not args.thinking_level:
+            cfg.thinking_level = args.reasoning_effort
+    if args.thinking_level: cfg.thinking_level = args.thinking_level
+    if args.hf_device_map: cfg.hf_device_map = args.hf_device_map
+    if args.hf_torch_dtype: cfg.hf_torch_dtype = args.hf_torch_dtype
+    if args.no_hf_trust_remote_code: cfg.hf_trust_remote_code = False
+    if args.hf_attn_implementation: cfg.hf_attn_implementation = args.hf_attn_implementation
     if args.timeout: cfg.per_call_timeout_s = args.timeout
     if args.train_size: cfg.train_size = args.train_size
     if args.val_size: cfg.val_size = args.val_size
@@ -835,7 +1356,7 @@ async def _amain(cfg: Config) -> None:
     try:
         rows = await runner.run()
     finally:
-        await runner.client.close()
+        await runner.aclose()
     write_csv(cfg.out_csv, rows)
     log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv})
 
