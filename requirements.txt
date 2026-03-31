@@ -12,9 +12,6 @@ safetensors
 
 # --- API Clients for LLM Services ---
 openai
-google-genai
-anthropic
-httpx
 
 # --- Other useful utilities ---
 tqdm

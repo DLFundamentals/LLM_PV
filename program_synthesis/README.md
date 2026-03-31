@@ -31,26 +31,6 @@ python program_synthesis/runner.py   --functions fn_a   --lengths 50   --attempt
 python program_synthesis/runner.py --enable-code-interpreter
 ```
 
-## Agent baseline (MLAgentBench)
-Clone [MLAgentBench](https://github.com/JunShern/MLAgentBench) into `external/` and install it once:
-
-```bash
-git clone https://github.com/JunShern/MLAgentBench external/MLAgentBench
-cd external/MLAgentBench
-pip install -e .
-bash install.sh
-cd ../../
-```
-
-```bash
-export OPENAI_API_KEY=sk-...
-export MLAB_LLM=gpt-5
-export MLAB_MAX_STEPS=30
-export NUM_TRIALS=5
-
-python program_synthesis/agent_baseline_runner.py --functions fn_a --lengths 100
-```
-
 ### Common flags
 - Grid: `--functions fn_a fn_b ...` • `--lengths 100 50 30 25 20` • `--attempts 5`
 - OpenAI: `--model gpt-5` • `--max-output-tokens 20000`  
